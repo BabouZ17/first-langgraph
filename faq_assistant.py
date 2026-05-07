@@ -53,7 +53,7 @@ def draft_response(state: FAQState) -> dict:
         f"Question: {state['user_question']}"
     )
     response = client.models.generate_content(
-        model="gemini-2.5-flash", contents=types.Part.from_text(text=prompt)
+        model="gemini-2.5-flash-lite", contents=types.Part.from_text(text=prompt)
     )
     return {"draft_response": response.text}
 

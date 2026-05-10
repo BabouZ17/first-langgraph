@@ -72,8 +72,9 @@ if __name__ == "__main__":
     )
     print(result)
 
-    snapshot = app.get_state(config)
-    print(
-        f"Turn count: {len([m for m in snapshot.values['messages'] if m["role"] == "user"])}"
-    )
-    print(f"Last response: {snapshot.values["response"][:100]}")
+for snapshot in app.get_state_history(config):
+    node = snapshot.metadata.get("source", "unknown")
+    print(f"\nAfter node: {node}")
+    print(f" user_message: {snapshot.values.get('user_message', 'not yet written')}")
+    print(f" messages: {snapshot.values.get('messages', 'not yet written')}")
+    print(f" response: {snapshot.values.get('response', 'not yet_written')}")

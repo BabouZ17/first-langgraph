@@ -150,7 +150,7 @@ def check_clarity(state: ResearchState) -> dict:
     )
 
     response = client.chat.completions.create(
-        model="openai/gpt-oss-20b",
+        model="openai/gpt-oss-120b",
         messages=[{"role": "user", "content": prompt}],
         response_format={
             "type": "json_schema",
@@ -298,7 +298,7 @@ def plan_searches(state: ResearchState) -> dict:
         f"Research question: {state['user_question']}\n\n"
     )
     response = client.chat.completions.create(
-        model="openai/gpt-oss-20b",
+        model="openai/gpt-oss-120b",
         messages=[{"role": "user", "content": prompt}],
         response_format={
             "type": "json_schema",
@@ -403,7 +403,7 @@ def synthesize_findings(state: ResearchState) -> dict:
     )
 
     response = client.chat.completions.create(
-        model="openai/gpt-oss-20b",
+        model="openai/gpt-oss-120b",
         messages=[{"role": "user", "content": prompt}],
         response_format={
             "type": "json_schema",
@@ -484,8 +484,27 @@ def build_graph() -> CompiledStateGraph:
     return builder.compile()
 
 
+def make_state(question: str, max_steps: int = 3) -> dict:
+    return {
+        "user_question": question,
+        "needs_clarification": False,
+        "clarification_question": "",
+        "search_plan": [],
+        "max_steps": max_steps,
+        "step_count": 0,
+        "search_results": [],
+        "sources_used": [],
+        "skipped_count": 0,
+        "synthesis": "",
+        "confidence_level": "",
+        "quality_passed": False,
+        "quality_note": "",
+        "formatted_response": "",
+    }
+
+
 def pretty_print(question: str, result: dict):
-    bar = "=" * 60
+    bar = "=" * 64
     print(f"\n{bar}")
     print(f" Question: {question[:80]}")
     print(bar)
@@ -496,39 +515,140 @@ def pretty_print(question: str, result: dict):
     print(f" search plan : {result['search_plan']}")
     print(f" step_count: {result['step_count']}")
     print(f" sources_used: {result['sources_used']}")
-    for i, (src, res) in enumerate(
-        zip(result["sources_used"], result["search_results"])
-    ):
-        print(f" result {i}: [{src}]: {res[:100]}")
-    print(f" synthesis: {result['synthesis']}")
-    print(f" formatted response: {result['formatted_response'][:200]}")
+    print(f" confidence_level: {result['confidence_level']}")
+    print(f" quality_passed: {result['quality_passed']}")
+    if result["quality_note"]:
+        print(f" quality_note: {result['quality_note']}")
+    print(f"\n RESPONSE:\n {result['formatted_response'][:400]}")
+
+
+def run_tests(app):
+    scenarios = [
+        {
+            "label": "Multi-domain: pricing + API",
+            "question": "What is the pricing for the Pro plan and what are the API rate limits?",
+            "max_steps": 3,
+            "expect_clarification": False,
+            "expect_quality_pass": True,
+        },
+        {
+            "label": "Single domain: refund policy",
+            "question": "How long do I have to request a refund for a digital product?",
+            "max_steps": 3,
+            "expect_clarification": False,
+            "expect_quality_pass": True,
+        },
+        {
+            "label": "Multi-domain: SDK + support tier",
+            "question": "Which SDKs are available and what level of support do Pro users get?",
+            "max_steps": 3,
+            "expect_clarification": False,
+            "expect_quality_pass": True,
+        },
+        {
+            "label": "Topic not in knowledge base",
+            "question": "What are the terms for early contract termination?",
+            "max_steps": 3,
+            "expect_clarification": False,
+            "expect_quality_pass": False,
+        },
+        {
+            "label": "Max steps cap (max_steps=1)",
+            "question": "What is the pricing, API rate limit, and support SLA for Enterprise?",
+            "max_steps": 1,
+            "expect_clarification": False,
+            "expect_quality_pass": None,  # depends on what one search returns
+        },
+        {
+            "label": "Clarification: too short",
+            "question": "api",
+            "max_steps": 3,
+            "expect_clarification": True,
+            "expect_quality_pass": None,
+        },
+        {
+            "label": "Clarification: vague opener",
+            "question": "Tell me everything",
+            "max_steps": 3,
+            "expect_clarification": True,
+            "expect_quality_pass": None,
+        },
+        {
+            "label": "Clarification: pronoun without topic",
+            "question": "How does it work?",
+            "max_steps": 3,
+            "expect_clarification": True,
+            "expect_quality_pass": None,
+        },
+    ]
+
+    passed = 0
+    failed = 0
+
+    for s in scenarios:
+        result = app.invoke(make_state(s["question"], s["max_steps"]))
+        nc = result["needs_clarification"]
+        qp = result.get("quality_passed", False)
+        ok_nc = nc == s["expect_clarification"]
+        ok_qp = (s["expect_quality_pass"] is None) or (qp == s["expect_quality_pass"])
+        status = "PASS" if (ok_nc and ok_qp) else "FAIL"
+        if status == "PASS":
+            passed += 1
+        else:
+            failed += 1
+
+        print(f"  [{status}] {s['label']}")
+        print(
+            f"         needs_clarification : {nc}  (expected {s['expect_clarification']})"
+        )
+        if not nc:
+            print(f"         sources_used        : {result['sources_used']}")
+            print(f"         skipped_count       : {result['skipped_count']}")
+            print(f"         confidence_level    : {result['confidence_level']}")
+            print(
+                f"         quality_passed      : {qp}  (expected {s['expect_quality_pass']})"
+            )
+            print(
+                f"         response preview    : {result['formatted_response'][:120]}"
+            )
+        else:
+            print(
+                f"         clarification asked : {result['clarification_question'][:100]}"
+            )
+        print()
+
+    print(
+        f"Results: {passed} passed, {failed} failed out of {len(scenarios)} scenarios.\n"
+    )
 
 
 if __name__ == "__main__":
     app = build_graph()
 
-    test_questions = [
-        "api",
-        "Tell me everything",
-        "What's the deal with your service?",
-        "What is the pricing for the Pro plan and what are the API rate limits?",
-        "What SDK is available and what level of support do Pro users get?",
-    ]
+    run_tests(app)
 
-    for question in test_questions:
-        result = app.invoke(
-            {
-                "user_question": question,
-                "needs_clarification": False,
-                "clarification_question": "",
-                "search_plan": [],
-                "max_steps": 3,
-                "step_count": 0,
-                "search_results": [],
-                "sources_used": [],
-                "synthesis": "",
-                "confidence_level": "",
-                "formatted_response": "",
-            }
-        )
-        pretty_print(question=question, result=result)
+    # test_questions = [
+    #     "api",
+    #     "Tell me everything",
+    #     "What's the deal with your service?",
+    #     "What is the pricing for the Pro plan and what are the API rate limits?",
+    #     "What SDK is available and what level of support do Pro users get?",
+    # ]
+
+    # for question in test_questions:
+    #     result = app.invoke(
+    #         {
+    #             "user_question": question,
+    #             "needs_clarification": False,
+    #             "clarification_question": "",
+    #             "search_plan": [],
+    #             "max_steps": 3,
+    #             "step_count": 0,
+    #             "search_results": [],
+    #             "sources_used": [],
+    #             "synthesis": "",
+    #             "confidence_level": "",
+    #             "formatted_response": "",
+    #         }
+    #     )
+    #     pretty_print(question=question, result=result)

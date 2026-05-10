@@ -40,7 +40,7 @@ class SearchDomainEnum(str, Enum):
         return [domain.value for domain in SearchDomainEnum]
 
 
-class SearchPlan(BaseModel):
+class SearchPlanResult(BaseModel):
     sub_queries: list[str]
 
     @field_validator("sub_queries")
@@ -53,6 +53,11 @@ class SearchPlan(BaseModel):
             if domain not in SearchDomainEnum.list_domains():
                 raise ValueError(f"Invalid domain: {domain}")
         return value
+
+
+class SynthesizeFindingsResult(BaseModel):
+    answer: str
+    confidence: Literal["high", "medium", "low"]
 
 
 class ResearchState(TypedDict):
@@ -165,6 +170,12 @@ def route_clarity(
     state: ResearchState,
 ) -> Literal["plan_searches", "return_clarification"]:
     return "return_clarification" if state["needs_clarification"] else "plan_searches"
+
+
+def route_review(
+    state: ResearchState,
+) -> Literal["format_fallback", "format_response"]:
+    return "format_response" if state["quality_passed"] else "format_fallback"
 
 
 def search_product_knowledge(query: str) -> str:
@@ -292,17 +303,17 @@ def plan_searches(state: ResearchState) -> dict:
         response_format={
             "type": "json_schema",
             "json_schema": {
-                "name": "SearchPlan",
-                "schema": SearchPlan.model_json_schema(),
+                "name": "SearchPlanResult",
+                "schema": SearchPlanResult.model_json_schema(),
             },
         },
     )
-    search_plan = SearchPlan.model_validate(
+    search_plan_result = SearchPlanResult.model_validate(
         json.loads(response.choices[0].message.content)
     )
     return {
-        "search_plan": search_plan.sub_queries,
-        "step_count": len(search_plan.sub_queries),
+        "search_plan": search_plan_result.sub_queries,
+        "step_count": len(search_plan_result.sub_queries),
     }
 
 
@@ -347,12 +358,105 @@ def execute_searches(state: ResearchState) -> dict:
     return {"search_results": results, "sources_used": sources, "skipped": skipped}
 
 
-def synthesize_findings(state: ResearchState) -> dict:
-    return {"synthesis": "", "confidence_level": ""}
-
-
 def format_response(state: ResearchState) -> dict:
-    return {"formatted_response": ""}
+    source_line = "Sources consulted: " + ", ".join(
+        s.replace("_", " ") for s in state["sources_used"]
+    )
+
+    confidence_badge = {
+        "high": "[HIGH CONFIDENCE]",
+        "medium": "[MEDIUM CONFIDENCE]",
+        "low": "[LOW CONFIDENCE]",
+    }.get(state["confidence_level"], "[CONFIDENCE UNKNOWN]")
+
+    response = f"{source_line}\n{confidence_badge}\n{state['synthesis']}"
+    return {"formatted_response": response}
+
+
+def synthesize_findings(state: ResearchState) -> dict:
+    if not state["search_results"]:
+        return {
+            "synthesis": "No search results were available to answer this question.",
+            "confidence_level": "low",
+        }
+
+    result_block = "".join(
+        f"Source {i} [{src}]:\n{res}\n\n"
+        for i, (src, res) in enumerate(
+            zip(state["sources_used"], state["search_results"]), 1
+        )
+    )
+    fallback_marker = "No specific"
+    covered = sum(1 for r in state["search_results"] if fallback_marker not in r)
+    coverage_ratio = covered / len(state["search_results"])
+
+    prompt = (
+        "You are a research synthesizer for a product knowledge assistant.\n\n"
+        "Using only the sources below, write a clear and direct answer to the "
+        "research question. Do not add information not present in the sources.\n\n"
+        f"Research question: {state['user_question']}\n\n"
+        f"Sources:\n{result_block}"
+        "Regarding confidence:\n"
+        "Use 'high' if all sources contained specific relevant information.\n"
+        "Use 'medium' if most sources were relevant but some were generic.\n"
+        "Use 'low' if most sources returned generic fallback content."
+    )
+
+    response = client.chat.completions.create(
+        model="openai/gpt-oss-20b",
+        messages=[{"role": "user", "content": prompt}],
+        response_format={
+            "type": "json_schema",
+            "json_schema": {
+                "name": "SynthesizeFindingsResult",
+                "schema": SynthesizeFindingsResult.model_json_schema(),
+            },
+        },
+    )
+
+    synthesize_findings_result = SynthesizeFindingsResult.model_validate(
+        json.loads(response.choices[0].message.content)
+    )
+    answer, confidence = (
+        synthesize_findings_result.answer,
+        synthesize_findings_result.confidence,
+    )
+
+    if not synthesize_findings_result.answer:
+        answer = "The retrieved sources did not contain enough information for a complete answer."
+        confidence = "low"
+    if coverage_ratio < 0.5 and confidence == "high":
+        confidence = "medium"
+    return {"synthesis": answer, "confidence_level": confidence}
+
+
+def review_synthesis(state: ResearchState) -> dict:
+    synthesis = state["synthesis"].strip()
+    word_count = len(synthesis.split())
+
+    too_short = word_count < 20
+    is_fallback = synthesis.startswith("No search results") or synthesis.startswith(
+        "The retrieve soruces dit not"
+    )
+
+    if too_short or is_fallback:
+        note = (
+            f"Synthesis is too short ({word_count} words)."
+            if too_short
+            else "Synthesis contains only a fallback message."
+        )
+        return {"quality_passed": False, "quality_note": note}
+    return {"quality_passed": True, "quality_note": ""}
+
+
+def format_fallback(state: ResearchState) -> dict:
+    return {
+        "formatted_response": (
+            "We were not able to find enough specific information to fully answer "
+            "your question. Please try rephrasing your question or contact our "
+            f"support team directly.\n\n[Quality note: {state['quality_note']}]"
+        )
+    }
 
 
 def build_graph() -> CompiledStateGraph:
@@ -363,15 +467,19 @@ def build_graph() -> CompiledStateGraph:
     builder.add_node("plan_searches", plan_searches)
     builder.add_node("execute_searches", execute_searches)
     builder.add_node("synthesize_findings", synthesize_findings)
+    builder.add_node("review_synthesis", review_synthesis)
     builder.add_node("format_response", format_response)
+    builder.add_node("format_fallback", format_fallback)
 
     builder.add_edge(START, "check_clarity")
     builder.add_conditional_edges("check_clarity", route_clarity)
+    builder.add_edge("return_clarification", END)
     builder.add_edge("plan_searches", "execute_searches")
     builder.add_edge("execute_searches", "synthesize_findings")
-    builder.add_edge("synthesize_findings", "format_response")
+    builder.add_edge("synthesize_findings", "review_synthesis")
+    builder.add_conditional_edges("review_synthesis", route_review)
     builder.add_edge("format_response", END)
-    builder.add_edge("return_clarification", END)
+    builder.add_edge("format_fallback", END)
 
     return builder.compile()
 
